@@ -5,6 +5,7 @@
 #include <Servo.h> 
 #include <Wire.h>
 #include "mpu6050.h"
+#include "Kalman.h"
 
 // define the pins used
 //#define CLK 13       // SPI Clock, shared with SD card
@@ -22,13 +23,18 @@
 
 Servo myservo1;  
 Servo myservo2;  
-int questions[12] = {0,1,2,3,4,5,6,7,8,9,10,11};
-const int yesResponses[12][4] = {{1,1,0,0},{1,0,0,1},{1,0,0,1},{1,1,0,0},{1,0,0,1},{1,0,1,0},{0,1,0,1},{1,0,1,0},{0,1,0,1},{0,1,0,1},{0,1,1,0},{1,0,0,1}};
-const int noResponses[12][4] = {{0,0,1,1},{0,1,1,0},{0,1,1,0},{0,0,1,1},{0,1,1,0},{0,1,0,1},{1,0,1,0},{0,1,0,1},{1,0,1,0},{1,0,1,0},{1,0,0,1},{0,1,1,0}};
+accel_t_gyro_union accel_t_gyro;
+
+int nodValue,shakeValue,nodRef,shakeRef, nod, shake = 0;  // variables to store the values coming from the sensors and calculate displacements in the (x,y) axis
+
+Kalman nodFilter(0.125, 32, 0, 0);
+Kalman shakeFilter(0.125, 32, 0, 0);
+
 Adafruit_VS1053_FilePlayer musicPlayer = 
   Adafruit_VS1053_FilePlayer(SHIELD_RESET, SHIELD_CS, SHIELD_DCS, DREQ, CARDCS);
+
 int houses[4] = {0,0,0,0};
-accel_t_gyro_union accel_t_gyro;
+int questions[12] = {0,1,2,3,4,5,6,7,8,9,10,11};
 
 void setup() {
   int error;
@@ -36,17 +42,17 @@ void setup() {
 
   Serial.begin(9600);
   Serial.println(F("sorting hat"));
+  
+  pinMode(BUTTON_PIN, INPUT);
 
   // Initialize the 'Wire' class for the I2C-bus.
   Wire.begin();
-
 
   // default at power-up:
   //    Gyro at 250 degrees second
   //    Acceleration at 2g
   //    Clock source at internal 8MHz
   //    The device is in sleep mode.
-  //
 
   error = MPU6050_read (MPU6050_WHO_AM_I, &c, 1);
   Serial.print(F("WHO_AM_I : "));
@@ -71,7 +77,7 @@ void setup() {
   myservo1.attach(3);  
   myservo2.attach(5); 
 
-  if (! musicPlayer.begin()) { // initialise the music player
+  if (!musicPlayer.begin()) { // initialise the music player
      Serial.println(F("Couldn't find VS1053, do you have the right pins defined?"));
      while (1);
   }
@@ -89,95 +95,53 @@ void setup() {
 
 void loop() {
   if (digitalRead(BUTTON_PIN) == HIGH) {
+    Serial.println(F("start the test"));
     playTest();
   }  
-  
-  int error;
-  double dT;
-
-
-  Serial.println(F(""));
-  Serial.println(F("MPU-6050"));
-
-  // Read the raw values.
-  // Read 14 bytes at once, 
-  // containing acceleration, temperature and gyro.
-  // With the default settings of the MPU-6050,
-  // there is no filter enabled, and the values
-  // are not very stable.
-  error = MPU6050_read (MPU6050_ACCEL_XOUT_H, (uint8_t *) &accel_t_gyro, sizeof(accel_t_gyro));
-  Serial.print(F("Read accel, temp and gyro, error = "));
-  Serial.println(error,DEC);
-
-
-  // Swap all high and low bytes.
-  // After this, the registers values are swapped, 
-  // so the structure name like x_accel_l does no 
-  // longer contain the lower byte.
-  uint8_t swap;
-  #define SWAP(x,y) swap = x; x = y; y = swap
-
-  SWAP (accel_t_gyro.reg.x_accel_h, accel_t_gyro.reg.x_accel_l);
-  SWAP (accel_t_gyro.reg.y_accel_h, accel_t_gyro.reg.y_accel_l);
-  SWAP (accel_t_gyro.reg.z_accel_h, accel_t_gyro.reg.z_accel_l);
-  SWAP (accel_t_gyro.reg.t_h, accel_t_gyro.reg.t_l);
-  SWAP (accel_t_gyro.reg.x_gyro_h, accel_t_gyro.reg.x_gyro_l);
-  SWAP (accel_t_gyro.reg.y_gyro_h, accel_t_gyro.reg.y_gyro_l);
-  SWAP (accel_t_gyro.reg.z_gyro_h, accel_t_gyro.reg.z_gyro_l);
-
-
-  // Print the raw acceleration values
-
-  Serial.print(F("accel x,y,z: "));
-  Serial.print(accel_t_gyro.value.x_accel, DEC);
-  Serial.print(F(", "));
-  Serial.print(accel_t_gyro.value.y_accel, DEC);
-  Serial.print(F(", "));
-  Serial.print(accel_t_gyro.value.z_accel, DEC);
-  Serial.println(F(""));
-
-  // Print the raw gyro values.
-
-  Serial.print(F("gyro x,y,z : "));
-  Serial.print(accel_t_gyro.value.x_gyro, DEC);
-  Serial.print(F(", "));
-  Serial.print(accel_t_gyro.value.y_gyro, DEC);
-  Serial.print(F(", "));
-  Serial.print(accel_t_gyro.value.z_gyro, DEC);
-  Serial.print(F(", "));
-  Serial.println(F(""));
 
   delay(1000);
 }
 
 void playTest() {
-  musicPlayer.playFullFile("preamble.mp3");
+  musicPlayer.playFullFile("intro003.mp3");
+  delay(3000);
   shuffle(questions,12);
-  intializeHouseValues();
   
-  int leader;
+  for (int i = 0; i < 4; i++)
+    houses[i] = 0;
+    
+  byte leader = 5;
   
   for (int i = 0; i < 12; i++) {
-    playQuestion(i);
+    playQuestion(questions[i]);
+    printCurrentPoints();
     leader = findHouseLeader(false);
-    if (i == 11 || leader != 0)
+    Serial.print(F("Leader is "));
+    Serial.println(leader, DEC);
+    if (i == 11 || leader != 5)
       break;
     else
       playRandomNoise();
   }
+  Serial.println("who da");
   if (leader!= 5)
     playHouseAnnouncement(leader);
-  else {
+  else
     playHouseAnnouncement(findHouseLeader(true));
-  }
 }
 
-int intializeHouseValues() {
-  for (int i = 0; i < 4; i++)
-    houses[i] = 0;
+void printCurrentPoints() {
+  Serial.print(F("Gryffindor: "));
+  Serial.print(houses[0], DEC);
+  Serial.print(F(", Slytherin: "));
+  Serial.print(houses[1], DEC);
+  Serial.print(F(", Ravenclaw: "));
+  Serial.print(houses[2], DEC);
+  Serial.print(F(", Hufflepuff: "));
+  Serial.println(houses[3], DEC);
 }
-  
-int findHouseLeader(bool goodEnough) {
+
+byte findHouseLeader(bool goodEnough) {
   int index = 0;
   int highestValue = houses[index];
   int secondHighestIndex = 5;
@@ -193,7 +157,7 @@ int findHouseLeader(bool goodEnough) {
   if (secondHighestValue + 3 <= highestValue)
     return index;
   else if (goodEnough) {
-    if (random(0,1) == 0)
+    if (random(0,2) == 0)
       return index;
     else
       return secondHighestIndex;
@@ -220,55 +184,70 @@ void controlMouth(int num, int delayTime) {
 
 void playRandomNoise() {
   char fileName[13];
-  sprintf_P(fileName, PSTR("random%01d.mp3"), random(0,8));
+  sprintf_P(fileName, PSTR("sound%03d.mp3"), random(0,8));
   musicPlayer.playFullFile(fileName);
 }
 
 void playQuestion(int questionNumber) {
   char fileName[13];
-  sprintf_P(fileName, PSTR("ques%03d.mp3"), questionNumber);
+  int yesResponses[12][4] = {{1,1,0,0},{1,0,0,1},{1,0,0,1},{1,1,0,0},{1,0,0,1},{1,0,1,0},{0,1,0,1},{1,0,1,0},{0,1,0,1},{0,1,0,1},{0,1,1,0},{1,0,0,1}};
+  int noResponses[12][4] = {{0,0,1,1},{0,1,1,0},{0,1,1,0},{0,0,1,1},{0,1,1,0},{0,1,0,1},{1,0,1,0},{0,1,0,1},{1,0,1,0},{1,0,1,0},{1,0,0,1},{0,1,1,0}};
+
+  sprintf_P(fileName, PSTR("quest%03d.mp3"), questionNumber);
+  calibrate(&nodRef, &shakeRef);
+  
   musicPlayer.playFullFile(fileName);
-  
+
   int response = getResponse();
-  
+    
+  Serial.print(F("Response is "));
+  Serial.println(response, DEC);
    if (response == 1) {
      for (int i = 0; i < 4; i++) {
        houses[i] = houses[i] + yesResponses[questionNumber][i];
      }
-   } else if (response == 0) {
+   } else {
      for (int i = 0; i < 4; i++) {
-       houses[i] = houses[i] + yesResponses[questionNumber][i];
+       houses[i] = houses[i] + noResponses[questionNumber][i];
      }
    }
 }
 
 int getResponse() {
   long startTime = millis();
-  bool nod = (accel_t_gyro.value.x_accel == 0) &&
-             (accel_t_gyro.value.y_accel == 0) &&
-             (accel_t_gyro.value.z_accel == 0) &&
-             (accel_t_gyro.value.x_gyro == 0) &&
-             (accel_t_gyro.value.y_gyro == 0) &&
-             (accel_t_gyro.value.z_gyro == 0);
-  bool shake = (accel_t_gyro.value.x_accel == 0) &&
-             (accel_t_gyro.value.y_accel == 0) &&
-             (accel_t_gyro.value.z_accel == 0) &&
-             (accel_t_gyro.value.x_gyro == 0) &&
-             (accel_t_gyro.value.y_gyro == 0) &&
-             (accel_t_gyro.value.z_gyro == 0);
-  while (!nod && !shake) {
-    if ((millis() - startTime) == (10 * 1000)) { // if it's been ten seconds
-      musicPlayer.startPlayingFile("track002.mp3"); // tell them to nod harder
+  
+  calibrate(&nod, &shake);
+  
+  double nodDelta = nod - nodRef;
+  double shakeDelta = shake - shakeRef;
+  
+  nod = round(nodFilter.getFilteredValue(nodDelta));
+  shake = round(shakeFilter.getFilteredValue(shakeDelta));
+  
+  while (nod <= 10 && shake <= 10) {
+    Serial.print(F("nod ref: "));
+    Serial.print(nodRef);
+    Serial.print(F(" shake ref: "));
+    Serial.println(shakeRef);
+    Serial.print(F("nod: "));
+    Serial.print(nod);
+    Serial.print(F(" shake: "));
+    Serial.println(shake);
+    
+    nod = round(nodFilter.getFilteredValue(nodDelta));
+    shake = round(shakeFilter.getFilteredValue(shakeDelta));
+    
+    if ((millis() - startTime) % (10000) == 0) { // every 10 seconds
+      musicPlayer.startPlayingFile("intro005.mp3"); // tell them to nod harder
     }
   }
   musicPlayer.stopPlaying();
-  if (nod) // if nod
+  if (nod > 10) // if nod
     return 1;
-  else if (shake) // if head shake
+  else
     return 0;
-  else // try again?? shouldn't happen
-    return getResponse();
 }
+
 void shuffle(int *array, size_t n) {
     if (n > 1) {
         size_t i;
@@ -288,10 +267,6 @@ void shuffle(int *array, size_t n) {
 //
 // This is a common function to read multiple bytes 
 // from an I2C device.
-//
-// It uses the boolean parameter for Wire.endTransMission()
-// to be able to hold or release the I2C-bus. 
-// This is implemented in Arduino 1.0.1.
 //
 // Only this function is used to read. 
 // There is no function for a single byte.
@@ -373,8 +348,71 @@ int MPU6050_write(int start, const uint8_t *pData, int size)
 int MPU6050_write_reg(int reg, uint8_t data)
 {
   int error;
-
   error = MPU6050_write(reg, &data, 1);
-
   return (error);
+}
+
+void MPU6050_clean_read() {
+
+  int error;
+  double dT;
+
+  Serial.println(F(""));
+
+  // Read the raw values.
+  // Read 14 bytes at once, 
+  // containing acceleration, temperature and gyro.
+  // With the default settings of the MPU-6050,
+  // there is no filter enabled, and the values
+  // are not very stable.
+  error = MPU6050_read (MPU6050_ACCEL_XOUT_H, (uint8_t *) &accel_t_gyro, sizeof(accel_t_gyro));
+  Serial.print(F("Read accel, temp and gyro, error = "));
+  Serial.println(error,DEC);
+
+  // Swap all high and low bytes.
+  // After this, the registers values are swapped, 
+  // so the structure name like x_accel_l no 
+  // longer contain the lower byte.
+  uint8_t swap;
+  #define SWAP(x,y) swap = x; x = y; y = swap
+
+  SWAP (accel_t_gyro.reg.x_accel_h, accel_t_gyro.reg.x_accel_l);
+  SWAP (accel_t_gyro.reg.y_accel_h, accel_t_gyro.reg.y_accel_l);
+  SWAP (accel_t_gyro.reg.z_accel_h, accel_t_gyro.reg.z_accel_l);
+  SWAP (accel_t_gyro.reg.t_h, accel_t_gyro.reg.t_l);
+  SWAP (accel_t_gyro.reg.x_gyro_h, accel_t_gyro.reg.x_gyro_l);
+  SWAP (accel_t_gyro.reg.y_gyro_h, accel_t_gyro.reg.y_gyro_l);
+  SWAP (accel_t_gyro.reg.z_gyro_h, accel_t_gyro.reg.z_gyro_l);
+
+
+/*
+  Serial.print(accel_t_gyro.value.x_accel, DEC);
+  Serial.print(accel_t_gyro.value.y_accel, DEC);
+  Serial.print(accel_t_gyro.value.z_accel, DEC);
+  Serial.print(accel_t_gyro.value.x_gyro, DEC);
+  Serial.print(accel_t_gyro.value.y_gyro, DEC);
+  Serial.print(accel_t_gyro.value.z_gyro, DEC);
+*/
+}
+
+
+void calibrate(int *n, int *s) {
+  //Calibrates the initial reference values of the accelerometer and reset the filters parameters according to the sensitivity value
+  int i;
+  
+  long newNod, newShake = 0;
+  //Average value from the 10 last consucutive sensor reads:
+  for (i=0;i<10;i++) {
+    MPU6050_clean_read();
+    newNod += accel_t_gyro.value.x_accel;
+    newShake += accel_t_gyro.value.x_gyro;
+  Serial.println(newNod);
+  Serial.println(newShake);
+    delay(100);
+  }
+  *n = round(newNod/i);
+  *s = round(newShake/i);
+  
+  Serial.println(*n);
+  Serial.println(*s);
 }
