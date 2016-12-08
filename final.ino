@@ -2,151 +2,170 @@
 #include <SPI.h>
 #include <Adafruit_VS1053.h>
 #include <SD.h>
-#include <Servo.h> 
+
+//#include <Servo.h>
 #include <Wire.h>
-#include "mpu6050.h"
-#include "Kalman.h"
+
+#include <I2Cdev.h>
+#include <MPU6050_6Axis_MotionApps20.h>
 
 // define the pins used
-//#define CLK 13       // SPI Clock, shared with SD card
-//#define MISO 12      // Input data, from VS1053/SD card
-//#define MOSI 11      // Output data, to VS1053/SD card
-#define BUTTON_PIN 1
+#define BUTTON_PIN 4
+#define SERVO1_PIN 3
+#define SERVO2_PIN 5
+#define INTERRUPT_PIN 2  // use pin 2 on Arduino Uno & most boards
 
 // These are the pins used for the music maker shield
-#define SHIELD_RESET  -1      // VS1053 reset pin (unused!)
 #define SHIELD_CS     7      // VS1053 chip select pin (output)
 #define SHIELD_DCS    6      // VS1053 Data/command select pin (output)
 #define CARDCS 4     // Card chip select pin
 // DREQ should be an Int pin, see http://arduino.cc/en/Reference/attachInterrupt
 #define DREQ 3       // VS1053 Data request, ideally an Interrupt pin
 
-Servo myservo1;  
-Servo myservo2;  
-accel_t_gyro_union accel_t_gyro;
+Adafruit_VS1053_FilePlayer musicPlayer =
+  Adafruit_VS1053_FilePlayer(-1, SHIELD_CS, SHIELD_DCS, DREQ, CARDCS);
 
-int nodValue,shakeValue,nodRef,shakeRef, nod, shake = 0;  // variables to store the values coming from the sensors and calculate displacements in the (x,y) axis
+MPU6050 mpu;
 
-Kalman nodFilter(0.125, 32, 0, 0);
-Kalman shakeFilter(0.125, 32, 0, 0);
+// MPU control/status vars
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
 
-Adafruit_VS1053_FilePlayer musicPlayer = 
-  Adafruit_VS1053_FilePlayer(SHIELD_RESET, SHIELD_CS, SHIELD_DCS, DREQ, CARDCS);
+// orientation/motion vars
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
 
-int houses[4] = {0,0,0,0};
-int questions[12] = {0,1,2,3,4,5,6,7,8,9,10,11};
+//Servo myservo1;
+//Servo myservo2;
+
+byte houses[4] = {0, 0, 0, 0};
+
+// ================================================================
+// ===               INTERRUPT DETECTION ROUTINE                ===
+// ================================================================
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady() {
+  mpuInterrupt = true;
+}
 
 void setup() {
-  int error;
-  uint8_t c;
-
   Serial.begin(9600);
-  Serial.println(F("sorting hat"));
-  
+  randomSeed(analogRead(5));
+
+
+  // initialize device
+  Serial.println(F("Initializing I2C devices..."));
+  mpu.initialize();
+  pinMode(INTERRUPT_PIN, INPUT);
+
+  // verify connection
+  Serial.println(F("Testing device connections..."));
+  Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
+
+  // load and configure the DMP
+  Serial.println(F("Initializing DMP..."));
+  devStatus = mpu.dmpInitialize();
+
+  // supply your own gyro offsets here, scaled for min sensitivity
+  mpu.setXGyroOffset(220);
+  mpu.setYGyroOffset(76);
+
+  // make sure it worked (returns 0 if so)
+  if (devStatus == 0) {
+    // turn on the DMP, now that it's ready
+    mpu.setDMPEnabled(true);
+
+    // enable Arduino interrupt detection
+    Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+    mpuIntStatus = mpu.getIntStatus();
+
+    // set our DMP Ready flag so the main loop() function knows it's okay to use it
+    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+    dmpReady = true;
+
+    // get expected DMP packet size for later comparison
+    packetSize = mpu.dmpGetFIFOPacketSize();
+  } else {
+    // ERROR!
+    // 1 = initial memory load failed
+    // 2 = DMP configuration updates failed
+    // (if it's going to break, usually the code will be 1)
+    Serial.print(F("DMP Initialization failed code = "));
+    Serial.print(devStatus);
+  }
+
   pinMode(BUTTON_PIN, INPUT);
-
-  // Initialize the 'Wire' class for the I2C-bus.
-  Wire.begin();
-
-  // default at power-up:
-  //    Gyro at 250 degrees second
-  //    Acceleration at 2g
-  //    Clock source at internal 8MHz
-  //    The device is in sleep mode.
-
-  error = MPU6050_read (MPU6050_WHO_AM_I, &c, 1);
-  Serial.print(F("WHO_AM_I : "));
-  Serial.print(c,HEX);
-  Serial.print(F(", error = "));
-  Serial.println(error,DEC);
-
-  // According to the datasheet, the 'sleep' bit
-  // should read a '1'.
-  // That bit has to be cleared, since the sensor
-  // is in sleep mode at power-up. 
-  error = MPU6050_read (MPU6050_PWR_MGMT_1, &c, 1);
-  Serial.print(F("PWR_MGMT_1 : "));
-  Serial.print(c,HEX);
-  Serial.print(F(", error = "));
-  Serial.println(error,DEC);
-
-
-  // Clear the 'sleep' bit to start the sensor.
-  MPU6050_write_reg (MPU6050_PWR_MGMT_1, 0);
-  
-  myservo1.attach(3);  
-  myservo2.attach(5); 
+  //myservo1.attach(SERVO1_PIN);
+  //myservo2.attach(SERVO2_PIN);
 
   if (!musicPlayer.begin()) { // initialise the music player
-     Serial.println(F("Couldn't find VS1053, do you have the right pins defined?"));
-     while (1);
+    Serial.println(F("Couldn't find VS1053, do you have the right pins defined?"));
+    while (1);
   }
-  Serial.println(F("VS1053 found"));
   
   SD.begin(CARDCS);    // initialise the SD card
-  
   // Set volume for left, right channels. lower numbers == louder volume!
-  musicPlayer.setVolume(20,20);
-  
-  // If DREQ is on an interrupt pin (on uno, #2 or #3) we can do background
-  // audio playing
-  musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT);
+  musicPlayer.setVolume(5, 5);
 }
 
 void loop() {
+  // if programming failed, don't try to do anything
+  if (!dmpReady) return;
+
   if (digitalRead(BUTTON_PIN) == HIGH) {
     Serial.println(F("start the test"));
     playTest();
-  }  
-
+  }
   delay(1000);
 }
 
 void playTest() {
-  musicPlayer.playFullFile("intro003.mp3");
-  delay(3000);
-  shuffle(questions,12);
-  
-  for (int i = 0; i < 4; i++)
-    houses[i] = 0;
-    
-  byte leader = 5;
-  
-  for (int i = 0; i < 12; i++) {
-    playQuestion(questions[i]);
-    printCurrentPoints();
-    leader = findHouseLeader(false);
-    Serial.print(F("Leader is "));
-    Serial.println(leader, DEC);
-    if (i == 11 || leader != 5)
-      break;
-    else
-      playRandomNoise();
-  }
-  Serial.println("who da");
-  if (leader!= 5)
-    playHouseAnnouncement(leader);
-  else
-    playHouseAnnouncement(findHouseLeader(true));
-}
+  const byte n = 12;
+  byte questions[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
 
-void printCurrentPoints() {
-  Serial.print(F("Gryffindor: "));
-  Serial.print(houses[0], DEC);
-  Serial.print(F(", Slytherin: "));
-  Serial.print(houses[1], DEC);
-  Serial.print(F(", Ravenclaw: "));
-  Serial.print(houses[2], DEC);
-  Serial.print(F(", Hufflepuff: "));
-  Serial.println(houses[3], DEC);
+  musicPlayer.playFullFile("intro003.mp3");
+  delay(2000); // give 'em time to process the instructions
+  
+  // shuffle the questions
+  for (size_t i = 0; i < n - 1; i++) {
+    size_t j = random(0, n-i);
+    byte t = questions[j];
+    questions[j] = questions[i];
+    questions[i] = t;
+  }
+
+  // reset values
+  for (size_t i = 0; i < 4; i++)
+    houses[i] = 0;
+
+  byte leader = 5;
+
+  for (size_t i = 0; i < n; i++) {
+    playQuestion(questions[i]);
+    leader = findHouseLeader(false);
+    playMP3("sound", random(1, 5));
+    if (leader != 5)
+      break;
+  }
+  
+  delay(2000);
+  
+  if (leader != 5)
+    playMP3("house", (leader+1));
+  else
+    playMP3("house", random(1,5));
+      
+  delay(10000);
 }
 
 byte findHouseLeader(bool goodEnough) {
-  int index = 0;
-  int highestValue = houses[index];
-  int secondHighestIndex = 5;
-  int secondHighestValue = 0;
-  for (int i = i; i < 4; i++) {
+  byte index,secondHighestIndex = 0;
+  byte highestValue,secondHighestValue = houses[index];
+  
+  for (byte i = i; i < 4; i++) {
     if (houses[index] <= houses[i]) {
       secondHighestIndex = index;
       secondHighestValue = houses[index];
@@ -157,262 +176,113 @@ byte findHouseLeader(bool goodEnough) {
   if (secondHighestValue + 3 <= highestValue)
     return index;
   else if (goodEnough) {
-    if (random(0,2) == 0)
+    if (random(0, 2) == 0)
       return index;
     else
       return secondHighestIndex;
   } else
     return 5;
 }
-void playHouseAnnouncement(int leader) {
-  char fileName[13];
-  sprintf_P(fileName, PSTR("house%02d.mp3"), leader);
-  musicPlayer.startPlayingFile(fileName);
-  controlMouth(90,500);
-  controlMouth(0,100);
-  controlMouth(90,500);
-  controlMouth(0,100);
-  controlMouth(90,500);
-  controlMouth(0,0);
-}
 
 void controlMouth(int num, int delayTime) {
-  myservo1.write(num);
-  myservo2.write(num);
+  //myservo1.write(num);
+  //myservo2.write(num);
   delay(delayTime);
 }
 
-void playRandomNoise() {
+void playMP3(char *fileType, byte number) {
   char fileName[13];
-  sprintf_P(fileName, PSTR("sound%03d.mp3"), random(0,8));
+  sprintf_P(fileName, PSTR("%s%03d.mp3"), fileType, number);
   musicPlayer.playFullFile(fileName);
 }
 
-void playQuestion(int questionNumber) {
+void playQuestion(byte questionNumber) {
   char fileName[13];
-  int yesResponses[12][4] = {{1,1,0,0},{1,0,0,1},{1,0,0,1},{1,1,0,0},{1,0,0,1},{1,0,1,0},{0,1,0,1},{1,0,1,0},{0,1,0,1},{0,1,0,1},{0,1,1,0},{1,0,0,1}};
-  int noResponses[12][4] = {{0,0,1,1},{0,1,1,0},{0,1,1,0},{0,0,1,1},{0,1,1,0},{0,1,0,1},{1,0,1,0},{0,1,0,1},{1,0,1,0},{1,0,1,0},{1,0,0,1},{0,1,1,0}};
+  bool yesResponses[12][4] = {{1, 1, 0, 0}, {1, 0, 0, 1}, {1, 0, 0, 1}, {1, 1, 0, 0}, {1, 0, 0, 1}, {1, 0, 1, 0}, {0, 1, 0, 1}, {1, 0, 1, 0}, {0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 1, 0}, {1, 0, 0, 1}};
+  bool noResponses[12][4] = {{0, 0, 1, 1}, {0, 1, 1, 0}, {0, 1, 1, 0}, {0, 0, 1, 1}, {0, 1, 1, 0}, {0, 1, 0, 1}, {1, 0, 1, 0}, {0, 1, 0, 1}, {1, 0, 1, 0}, {1, 0, 1, 0}, {1, 0, 0, 1}, {0, 1, 1, 0}};
 
-  sprintf_P(fileName, PSTR("quest%03d.mp3"), questionNumber);
-  calibrate(&nodRef, &shakeRef);
-  
-  musicPlayer.playFullFile(fileName);
+  playMP3("quest", questionNumber);
 
-  int response = getResponse();
-    
-  Serial.print(F("Response is "));
-  Serial.println(response, DEC);
-   if (response == 1) {
-     for (int i = 0; i < 4; i++) {
-       houses[i] = houses[i] + yesResponses[questionNumber][i];
-     }
-   } else {
-     for (int i = 0; i < 4; i++) {
-       houses[i] = houses[i] + noResponses[questionNumber][i];
-     }
-   }
-}
+  bool response = getResponse();
 
-int getResponse() {
-  long startTime = millis();
-  
-  calibrate(&nod, &shake);
-  
-  double nodDelta = nod - nodRef;
-  double shakeDelta = shake - shakeRef;
-  
-  nod = round(nodFilter.getFilteredValue(nodDelta));
-  shake = round(shakeFilter.getFilteredValue(shakeDelta));
-  
-  while (nod <= 10 && shake <= 10) {
-    Serial.print(F("nod ref: "));
-    Serial.print(nodRef);
-    Serial.print(F(" shake ref: "));
-    Serial.println(shakeRef);
-    Serial.print(F("nod: "));
-    Serial.print(nod);
-    Serial.print(F(" shake: "));
-    Serial.println(shake);
-    
-    nod = round(nodFilter.getFilteredValue(nodDelta));
-    shake = round(shakeFilter.getFilteredValue(shakeDelta));
-    
-    if ((millis() - startTime) % (10000) == 0) { // every 10 seconds
-      musicPlayer.startPlayingFile("intro005.mp3"); // tell them to nod harder
-    }
+  for (byte i = 0; i < 4; i++) {
+    if (response == 1)
+      houses[i] = houses[i] + yesResponses[questionNumber][i];
+    else
+      houses[i] = houses[i] + noResponses[questionNumber][i];
   }
-  musicPlayer.stopPlaying();
-  if (nod > 10) // if nod
-    return 1;
-  else
-    return 0;
 }
 
-void shuffle(int *array, size_t n) {
-    if (n > 1) {
-        size_t i;
-        for (i = 0; i < n - 1; i++) {
-          size_t j = i + rand() / (RAND_MAX / (n - i) + 1);
-          int t = array[j];
-          array[j] = array[i];
-          array[i] = t;
-        }
-    }
-}
+bool getResponse() {
+  long startTime;
+  delay(3000);
+  return random(0,2); // just quit anyways
+  readAG();
 
-
-
-// --------------------------------------------------------
-// MPU6050_read
-//
-// This is a common function to read multiple bytes 
-// from an I2C device.
-//
-// Only this function is used to read. 
-// There is no function for a single byte.
-//
-int MPU6050_read(int start, uint8_t *buffer, int size)
-{
-  int i, n, error;
-
-  Wire.beginTransmission(MPU6050_I2C_ADDRESS);
-  n = Wire.write(start);
-  if (n != 1)
-    return (-10);
-
-  n = Wire.endTransmission(false);    // hold the I2C-bus
-  if (n != 0)
-    return (n);
-
-  // Third parameter is true: relase I2C-bus after data is read.
-  Wire.requestFrom(MPU6050_I2C_ADDRESS, size, true);
-  i = 0;
-  while(Wire.available() && i<size)
-  {
-    buffer[i++]=Wire.read();
-  }
-  if ( i != size)
-    return (-11);
-
-  return (0);  // return : no error
-}
-
-
-// --------------------------------------------------------
-// MPU6050_write
-//
-// This is a common function to write multiple bytes to an I2C device.
-//
-// If only a single register is written,
-// use the function MPU_6050_write_reg().
-//
-// Parameters:
-//   start : Start address, use a define for the register
-//   pData : A pointer to the data to write.
-//   size  : The number of bytes to write.
-//
-// If only a single register is written, a pointer
-// to the data has to be used, and the size is
-// a single byte:
-//   int data = 0;        // the data to write
-//   MPU6050_write (MPU6050_PWR_MGMT_1, &c, 1);
-//
-int MPU6050_write(int start, const uint8_t *pData, int size)
-{
-  int n, error;
-
-  Wire.beginTransmission(MPU6050_I2C_ADDRESS);
-  n = Wire.write(start);        // write the start address
-  if (n != 1)
-    return (-20);
-
-  n = Wire.write(pData, size);  // write data bytes
-  if (n != size)
-    return (-21);
-
-  error = Wire.endTransmission(true); // release the I2C-bus
-  if (error != 0)
-    return (error);
-
-  return (0);         // return : no error
-}
-
-// --------------------------------------------------------
-// MPU6050_write_reg
-//
-// An extra function to write a single register.
-// It is just a wrapper around the MPU_6050_write()
-// function, and it is only a convenient function
-// to make it easier to write a single register.
-//
-int MPU6050_write_reg(int reg, uint8_t data)
-{
-  int error;
-  error = MPU6050_write(reg, &data, 1);
-  return (error);
-}
-
-void MPU6050_clean_read() {
-
-  int error;
-  double dT;
-
-  Serial.println(F(""));
-
-  // Read the raw values.
-  // Read 14 bytes at once, 
-  // containing acceleration, temperature and gyro.
-  // With the default settings of the MPU-6050,
-  // there is no filter enabled, and the values
-  // are not very stable.
-  error = MPU6050_read (MPU6050_ACCEL_XOUT_H, (uint8_t *) &accel_t_gyro, sizeof(accel_t_gyro));
-  Serial.print(F("Read accel, temp and gyro, error = "));
-  Serial.println(error,DEC);
-
-  // Swap all high and low bytes.
-  // After this, the registers values are swapped, 
-  // so the structure name like x_accel_l no 
-  // longer contain the lower byte.
-  uint8_t swap;
-  #define SWAP(x,y) swap = x; x = y; y = swap
-
-  SWAP (accel_t_gyro.reg.x_accel_h, accel_t_gyro.reg.x_accel_l);
-  SWAP (accel_t_gyro.reg.y_accel_h, accel_t_gyro.reg.y_accel_l);
-  SWAP (accel_t_gyro.reg.z_accel_h, accel_t_gyro.reg.z_accel_l);
-  SWAP (accel_t_gyro.reg.t_h, accel_t_gyro.reg.t_l);
-  SWAP (accel_t_gyro.reg.x_gyro_h, accel_t_gyro.reg.x_gyro_l);
-  SWAP (accel_t_gyro.reg.y_gyro_h, accel_t_gyro.reg.y_gyro_l);
-  SWAP (accel_t_gyro.reg.z_gyro_h, accel_t_gyro.reg.z_gyro_l);
-
-
-/*
-  Serial.print(accel_t_gyro.value.x_accel, DEC);
-  Serial.print(accel_t_gyro.value.y_accel, DEC);
-  Serial.print(accel_t_gyro.value.z_accel, DEC);
-  Serial.print(accel_t_gyro.value.x_gyro, DEC);
-  Serial.print(accel_t_gyro.value.y_gyro, DEC);
-  Serial.print(accel_t_gyro.value.z_gyro, DEC);
-*/
-}
-
-
-void calibrate(int *n, int *s) {
-  //Calibrates the initial reference values of the accelerometer and reset the filters parameters according to the sensitivity value
-  int i;
+  float firstPitch, topPitch = ypr[1];
+  float firstYaw, topYaw, bottomYaw = ypr[0];
   
-  long newNod, newShake = 0;
-  //Average value from the 10 last consucutive sensor reads:
-  for (i=0;i<10;i++) {
-    MPU6050_clean_read();
-    newNod += accel_t_gyro.value.x_accel;
-    newShake += accel_t_gyro.value.x_gyro;
-  Serial.println(newNod);
-  Serial.println(newShake);
-    delay(100);
+  for (int i = 0; i < 2; i++) {
+    startTime = millis();
+     while (millis()-startTime < 8000) { // don't wait longer than 8s
+      readAG();
+          
+      if (ypr[0] > topYaw)
+        topYaw = ypr[0];
+      else if (ypr[0] < bottomYaw)
+        bottomYaw = ypr[0];
+        
+      if (ypr[1] > topPitch)
+        topPitch = ypr[1];
+              
+      if (topPitch > firstPitch+3) { // if nod
+        return 1;
+      } else if ((topYaw > firstYaw+20) && (bottomYaw < firstYaw-20)) { // if shake
+        return 0;
+      }
+    }   
+    musicPlayer.playFullFile("intro005.mp3"); // tell them to nod harder
   }
-  *n = round(newNod/i);
-  *s = round(newShake/i);
-  
-  Serial.println(*n);
-  Serial.println(*s);
+  return random(0,2); // just quit anyways
+}
+
+void readAG() {
+  uint16_t fifoCount;     // count of all bytes currently in FIFO
+  uint8_t fifoBuffer[64]; // FIFO storage buffer
+
+  Quaternion q;           // [w, x, y, z]         quaternion container
+  VectorFloat gravity;    // [x, y, z]            gravity vector
+
+  // wait for MPU interrupt or extra packet(s) available
+  while (!mpuInterrupt && fifoCount < packetSize) {
+  }
+
+  // reset interrupt flag and get INT_STATUS byte
+  mpuInterrupt = false;
+  mpuIntStatus = mpu.getIntStatus();
+
+  // get current FIFO count
+  fifoCount = mpu.getFIFOCount();
+
+  // check for overflow (this should never happen unless our code is too inefficient)
+  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+    // reset so we can continue cleanly
+    mpu.resetFIFO();
+    // otherwise, check for DMP data ready interrupt (this should happen frequently)
+  } else if (mpuIntStatus & 0x02) {
+    // wait for correct available data length, should be a VERY short wait
+    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+
+    // read a packet from FIFO
+    mpu.getFIFOBytes(fifoBuffer, packetSize);
+
+    // track FIFO count here in case there is > 1 packet available
+    // (this lets us immediately read more without waiting for an interrupt)
+    fifoCount -= packetSize;
+
+    // display Euler angles in degrees
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+  }
 }
