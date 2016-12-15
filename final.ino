@@ -3,17 +3,17 @@
 #include <Adafruit_VS1053.h>
 #include <SD.h>
 
-//#include <Servo.h>
+#include <Servo.h>
 #include <Wire.h>
 
 #include <I2Cdev.h>
 #include <MPU6050_6Axis_MotionApps20.h>
 
 // define the pins used
-#define BUTTON_PIN 4
-#define SERVO1_PIN 3
-#define SERVO2_PIN 5
 #define INTERRUPT_PIN 2  // use pin 2 on Arduino Uno & most boards
+#define BUTTON_PIN 5
+#define SERVO1_PIN 9
+#define SERVO2_PIN 11
 
 // These are the pins used for the music maker shield
 #define SHIELD_CS     7      // VS1053 chip select pin (output)
@@ -28,7 +28,6 @@ Adafruit_VS1053_FilePlayer musicPlayer =
 MPU6050 mpu;
 
 // MPU control/status vars
-bool dmpReady = false;  // set true if DMP init was successful
 uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
 uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
 uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
@@ -36,41 +35,39 @@ uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
 // orientation/motion vars
 float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
 
-//Servo myservo1;
-//Servo myservo2;
+Servo myservo1;
+Servo myservo2;
 
 byte houses[4] = {0, 0, 0, 0};
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady() {
+    mpuInterrupt = true;
+}
 
 // ================================================================
 // ===               INTERRUPT DETECTION ROUTINE                ===
 // ================================================================
 
-volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
-void dmpDataReady() {
-  mpuInterrupt = true;
-}
-
 void setup() {
-  Serial.begin(9600);
-  randomSeed(analogRead(5));
-
+  Wire.begin();
+  TWBR = 12;
+  Serial.begin(115200);
+  randomSeed(analogRead(5)); // randomize so random works properly
 
   // initialize device
-  Serial.println(F("Initializing I2C devices..."));
   mpu.initialize();
   pinMode(INTERRUPT_PIN, INPUT);
 
   // verify connection
-  Serial.println(F("Testing device connections..."));
   Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
 
   // load and configure the DMP
-  Serial.println(F("Initializing DMP..."));
   devStatus = mpu.dmpInitialize();
-
-  // supply your own gyro offsets here, scaled for min sensitivity
+  
   mpu.setXGyroOffset(220);
   mpu.setYGyroOffset(76);
+  mpu.setZGyroOffset(-85);
 
   // make sure it worked (returns 0 if so)
   if (devStatus == 0) {
@@ -78,13 +75,8 @@ void setup() {
     mpu.setDMPEnabled(true);
 
     // enable Arduino interrupt detection
-    Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
     attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
     mpuIntStatus = mpu.getIntStatus();
-
-    // set our DMP Ready flag so the main loop() function knows it's okay to use it
-    Serial.println(F("DMP ready! Waiting for first interrupt..."));
-    dmpReady = true;
 
     // get expected DMP packet size for later comparison
     packetSize = mpu.dmpGetFIFOPacketSize();
@@ -98,23 +90,21 @@ void setup() {
   }
 
   pinMode(BUTTON_PIN, INPUT);
-  //myservo1.attach(SERVO1_PIN);
-  //myservo2.attach(SERVO2_PIN);
+  myservo1.attach(SERVO1_PIN);
+  myservo2.attach(SERVO2_PIN);
+  
 
   if (!musicPlayer.begin()) { // initialise the music player
-    Serial.println(F("Couldn't find VS1053, do you have the right pins defined?"));
+    Serial.println(F("Couldn't find VS1053"));
     while (1);
   }
   
   SD.begin(CARDCS);    // initialise the SD card
   // Set volume for left, right channels. lower numbers == louder volume!
-  musicPlayer.setVolume(5, 5);
+  musicPlayer.setVolume(5,5);
 }
 
 void loop() {
-  // if programming failed, don't try to do anything
-  if (!dmpReady) return;
-
   if (digitalRead(BUTTON_PIN) == HIGH) {
     Serial.println(F("start the test"));
     playTest();
@@ -126,8 +116,10 @@ void playTest() {
   const byte n = 12;
   byte questions[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
 
+  controlMouth(0,0,0);
+
   musicPlayer.playFullFile("intro003.mp3");
-  delay(2000); // give 'em time to process the instructions
+  delay(1000); // give 'em time to process the instructions
   
   // shuffle the questions
   for (size_t i = 0; i < n - 1; i++) {
@@ -145,27 +137,33 @@ void playTest() {
 
   for (size_t i = 0; i < n; i++) {
     playQuestion(questions[i]);
+  
     leader = findHouseLeader(false);
-    playMP3("sound", random(1, 5));
     if (leader != 5)
       break;
+    else
+      playMP3("sound", random(0, 5), true);
   }
+    
+  playMP3("sound", random(7, 8), true);
   
-  delay(2000);
   
   if (leader != 5)
-    playMP3("house", (leader+1));
+    playMP3("house", leader, false);
   else
-    playMP3("house", random(1,5));
-      
-  delay(10000);
+    playMP3("house", findHouseLeader(true), false);
+  controlMouth(80,40,700);
+  controlMouth(80,40,600);
+  controlMouth(80,0,700);
 }
 
 byte findHouseLeader(bool goodEnough) {
-  byte index,secondHighestIndex = 0;
-  byte highestValue,secondHighestValue = houses[index];
+  byte index = 0;
+  byte secondHighestIndex = 0;
+  byte highestValue = houses[index];
+  byte secondHighestValue = houses[index];
   
-  for (byte i = i; i < 4; i++) {
+  for (byte i = 1; i < 4; i++) {
     if (houses[index] <= houses[i]) {
       secondHighestIndex = index;
       secondHighestValue = houses[index];
@@ -184,16 +182,21 @@ byte findHouseLeader(bool goodEnough) {
     return 5;
 }
 
-void controlMouth(int num, int delayTime) {
-  //myservo1.write(num);
-  //myservo2.write(num);
-  delay(delayTime);
+void controlMouth(int num1, int num2, int waitTime) {
+  myservo1.write(num1);
+  myservo2.write(num1);
+  delay(waitTime);
+  myservo1.write(num2);
+  myservo2.write(num2);
 }
 
-void playMP3(char *fileType, byte number) {
+void playMP3(char *fileType, byte number, bool full) {
   char fileName[13];
-  sprintf_P(fileName, PSTR("%s%03d.mp3"), fileType, number);
-  musicPlayer.playFullFile(fileName);
+  sprintf_P(fileName, PSTR("%s%03d.mp3"), fileType, number+1);
+  if (full = true)
+    musicPlayer.playFullFile(fileName);
+  else
+    musicPlayer.startPlayingFile(fileName);
 }
 
 void playQuestion(byte questionNumber) {
@@ -201,7 +204,7 @@ void playQuestion(byte questionNumber) {
   bool yesResponses[12][4] = {{1, 1, 0, 0}, {1, 0, 0, 1}, {1, 0, 0, 1}, {1, 1, 0, 0}, {1, 0, 0, 1}, {1, 0, 1, 0}, {0, 1, 0, 1}, {1, 0, 1, 0}, {0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 1, 0}, {1, 0, 0, 1}};
   bool noResponses[12][4] = {{0, 0, 1, 1}, {0, 1, 1, 0}, {0, 1, 1, 0}, {0, 0, 1, 1}, {0, 1, 1, 0}, {0, 1, 0, 1}, {1, 0, 1, 0}, {0, 1, 0, 1}, {1, 0, 1, 0}, {1, 0, 1, 0}, {1, 0, 0, 1}, {0, 1, 1, 0}};
 
-  playMP3("quest", questionNumber);
+  playMP3("quest", questionNumber, true);
 
   bool response = getResponse();
 
@@ -215,38 +218,49 @@ void playQuestion(byte questionNumber) {
 
 bool getResponse() {
   long startTime;
-  delay(3000);
-  return random(0,2); // just quit anyways
-  readAG();
-
-  float firstPitch, topPitch = ypr[1];
-  float firstYaw, topYaw, bottomYaw = ypr[0];
+  
+  mpu.resetFIFO();
+  
+  while (readAG()==false);
   
   for (int i = 0; i < 2; i++) {
+    if (i > 0)
+      musicPlayer.startPlayingFile("intro005.mp3"); // tell them to nod harder
+
+    float topPitch = ypr[1];
+    float bottomPitch = ypr[1];
+    float topYaw = ypr[0];
+    float bottomYaw = ypr[0];
+    
     startTime = millis();
-     while (millis()-startTime < 8000) { // don't wait longer than 8s
-      readAG();
+    while (millis()-startTime < 15000) { // wait 15s before asking
+      while (readAG()==false);
           
+      if (ypr[1] > topPitch)
+        topPitch = ypr[1];
+      else if (ypr[1] < bottomPitch)
+        bottomPitch = ypr[1];
+        
       if (ypr[0] > topYaw)
         topYaw = ypr[0];
       else if (ypr[0] < bottomYaw)
         bottomYaw = ypr[0];
-        
-      if (ypr[1] > topPitch)
-        topPitch = ypr[1];
-              
-      if (topPitch > firstPitch+3) { // if nod
-        return 1;
-      } else if ((topYaw > firstYaw+20) && (bottomYaw < firstYaw-20)) { // if shake
+    
+      if (abs(topYaw - bottomYaw) > 0.4) { // if shake
+        Serial.println("no");
         return 0;
-      }
-    }   
-    musicPlayer.playFullFile("intro005.mp3"); // tell them to nod harder
+      } else if (abs(topPitch - bottomPitch) > 0.25) { // if nod
+        Serial.println("yes");
+        return 1;
+      } 
+    }
   }
-  return random(0,2); // just quit anyways
+  return random(0,2); // just quit and randomize
 }
 
-void readAG() {
+bool readAG() {
+  long startTime = millis();
+
   uint16_t fifoCount;     // count of all bytes currently in FIFO
   uint8_t fifoBuffer[64]; // FIFO storage buffer
 
@@ -255,6 +269,8 @@ void readAG() {
 
   // wait for MPU interrupt or extra packet(s) available
   while (!mpuInterrupt && fifoCount < packetSize) {
+    if (millis()-startTime>3000)
+      return false;
   }
 
   // reset interrupt flag and get INT_STATUS byte
@@ -265,24 +281,19 @@ void readAG() {
   fifoCount = mpu.getFIFOCount();
 
   // check for overflow (this should never happen unless our code is too inefficient)
-  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+  if ((mpuIntStatus & 0x10) || fifoCount > packetSize) {
     // reset so we can continue cleanly
     mpu.resetFIFO();
-    // otherwise, check for DMP data ready interrupt (this should happen frequently)
+    Serial.println(F("FIFO overflow!"));
+    return false;
   } else if (mpuIntStatus & 0x02) {
-    // wait for correct available data length, should be a VERY short wait
-    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
-
     // read a packet from FIFO
     mpu.getFIFOBytes(fifoBuffer, packetSize);
-
-    // track FIFO count here in case there is > 1 packet available
-    // (this lets us immediately read more without waiting for an interrupt)
-    fifoCount -= packetSize;
 
     // display Euler angles in degrees
     mpu.dmpGetQuaternion(&q, fifoBuffer);
     mpu.dmpGetGravity(&gravity, &q);
     mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+    return true;
   }
 }
